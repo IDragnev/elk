@@ -1,4 +1,7 @@
-use mmap::MemoryMap;
+use mmap::{
+    MemoryMap,
+    MapOption,
+};
 use custom_debug_derive::Debug as CustomDebug;
 use std::{
     path::{
@@ -9,16 +12,30 @@ use std::{
     collections::{
         HashMap,
     },
+    ops::Range,
+    cmp::{
+        min,
+        max,
+    },
 };
+use enumflags2::BitFlags;
+
+#[derive(CustomDebug)]
+pub struct Segment {
+    #[debug(skip)]
+    pub map: MemoryMap,
+    pub padding: delf::Addr,
+    pub flags: BitFlags<delf::SegmentFlag>,
+}
 
 #[derive(CustomDebug)]
 pub struct Object {
     pub path: PathBuf,
     pub base: delf::Addr,
+    pub mem_range: Range<delf::Addr>,
+    pub maps: Vec<Segment>,
     #[debug(skip)]
     pub file: delf::File,
-    #[debug(skip)]
-    pub maps: Vec<MemoryMap>,
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -31,6 +48,10 @@ pub enum LoadError {
     IO(PathBuf, std::io::Error),
     #[error("ELF object could not be parsed: {0}")]
     ParseError(PathBuf),
+    #[error("ELF object has no load segments")]
+    NoLoadSegments,
+    #[error("ELF object could not be mapped in memory: {0}")]
+    MapError(#[from] mmap::MapError),   
 }
 
 #[derive(Debug)]
@@ -90,10 +111,15 @@ impl Process {
     }
 
     pub fn load_object<P: AsRef<Path>>(&mut self, path: P) -> Result<usize, LoadError> {
+        use std::io::Read;
+
         let path: PathBuf = path.as_ref()
                                 .canonicalize()
                                 .map_err(|e| LoadError::IO(path.as_ref().to_path_buf(), e))?;
-        let input: Vec<u8> = fs::read(&path).map_err(|e| LoadError::IO(path.clone(), e))?;
+
+        let mut fs_file = fs::File::open(&path).map_err(|e| LoadError::IO(path.clone(), e))?;
+        let mut input = Vec::new();
+        fs_file.read_to_end(&mut input).map_err(|e| LoadError::IO(path.clone(), e))?;
 
         println!("Loading {:?}", path);
         let file = delf::File::parse_or_print_error(&input[..])
@@ -111,11 +137,69 @@ impl Process {
             self.search_path.push(PathBuf::from(rpath));
         }
 
+        let load_segments = || {
+            file.program_headers
+                .iter()
+                .filter(|ph| ph.r#type == delf::SegmentType::Load)
+        };
+
+        let mem_range = load_segments()
+                        .map(|ph| ph.mem_range())
+                        .fold(None, |acc, mem_range| {
+                            match acc {
+                                None => Some(mem_range),
+                                Some(acc) => Some(convex_hull(acc, mem_range)),
+                            }
+                        })
+                        .ok_or_else(|| LoadError::NoLoadSegments)?;
+
+        let mem_size: usize = (mem_range.end - mem_range.start).into();
+        let mem_map = MemoryMap::new(mem_size, &[])?;
+        let base = delf::Addr(mem_map.data() as _) - mem_range.start;
+
+        let maps = load_segments().filter_map(|ph| {
+            if ph.memsz.0 > 0 {
+                use std::os::unix::io::AsRawFd;
+
+                let vaddr = delf::Addr(ph.vaddr.0 & !0xFFF);
+                let padding = ph.vaddr - vaddr;
+                let offset = ph.offset - padding;
+                let memsz = ph.memsz + padding;
+                println!("> {:#?}", ph);
+                println!(
+                    "< file {:#?} | mem {:#?}",
+                    offset..(offset + memsz),
+                    vaddr..(vaddr + memsz)
+                );
+
+                let map_res = MemoryMap::new(
+                        memsz.into(),
+                        &[
+                            MapOption::MapReadable,
+                            MapOption::MapWritable,
+                            MapOption::MapFd(fs_file.as_raw_fd()),
+                            MapOption::MapOffset(offset.into()),
+                            MapOption::MapAddr(unsafe { (base + vaddr).as_ptr() }),
+                        ],
+                    );
+
+                Some(map_res.map(|map| Segment {
+                    map,
+                    padding,
+                    flags: ph.flags,
+                }))
+            } else {
+                None
+            }
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
         let obj = Object {
             path: path.clone(),
-            base: delf::Addr(0x400000),
-            maps: Vec::new(),
+            base,
+            maps,
             file,
+            mem_range,
         };
         let index = self.objects.len();
         self.objects.push(obj);
@@ -139,4 +223,8 @@ impl Process {
             .find(|path| path.exists())
             .ok_or_else(|| LoadError::NotFound(name.into()))
     }
+}
+
+fn convex_hull(a: Range<delf::Addr>, b: Range<delf::Addr>) -> Range<delf::Addr> {
+    (min(a.start, b.start))..(max(a.end, b.end))
 }
