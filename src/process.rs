@@ -178,26 +178,24 @@ impl Process {
                         .ok_or_else(|| LoadError::NoLoadSegments)?;
 
         let mem_size: usize = (mem_range.end - mem_range.start).into();
-        let mem_map = std::mem::ManuallyDrop::new(MemoryMap::new(mem_size, &[])?);
+        let mem_map = std::mem::ManuallyDrop::new(MemoryMap::new(
+            mem_size,
+             &[MapOption::MapReadable, MapOption::MapWritable],
+        )?);
         let base = delf::Addr(mem_map.data() as _) - mem_range.start;
 
-        let maps = load_segments().filter_map(|ph| {
-            if ph.memsz.0 > 0 {
+        let maps = load_segments()
+            .filter(|ph| ph.memsz.0 > 0)
+            .map(|ph| -> Result<_, LoadError> {
                 use std::os::unix::io::AsRawFd;
 
                 let vaddr = delf::Addr(ph.vaddr.0 & !0xFFF);
                 let padding = ph.vaddr - vaddr;
                 let offset = ph.offset - padding;
-                let memsz = ph.memsz + padding;
-                println!("> {:#?}", ph);
-                println!(
-                    "< file {:#?} | mem {:#?}",
-                    offset..(offset + memsz),
-                    vaddr..(vaddr + memsz)
-                );
+                let filesz = ph.filesz + padding;
 
-                let map_res = MemoryMap::new(
-                        memsz.into(),
+                let map = MemoryMap::new(
+                        filesz.into(),
                         &[
                             MapOption::MapReadable,
                             MapOption::MapWritable,
@@ -205,18 +203,26 @@ impl Process {
                             MapOption::MapOffset(offset.into()),
                             MapOption::MapAddr(unsafe { (base + vaddr).as_ptr() }),
                         ],
-                    );
+                )?;
 
-                Some(map_res.map(|map| Segment {
+                // zero any additional bytes
+                if ph.memsz > ph.filesz {
+                    let mut zero_start = base + ph.mem_range().start + ph.filesz;
+                    let zero_len = ph.memsz - ph.filesz;
+                    unsafe {
+                        for i in zero_start.as_mut_slice(zero_len.into()) {
+                            *i = 0u8;
+                        }
+                    }
+                }
+
+                Ok(Segment {
                     map,
                     padding,
                     flags: ph.flags,
-                }))
-            } else {
-                None
-            }
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
 
         let syms = file.read_syms()?;
 
@@ -268,7 +274,7 @@ impl Process {
                                         .lookup_symbol(&name, None)?
                                         .ok_or(RelocationError::UndefinedSymbol(name))?;
 
-                                    let offset = obj.base + rel.offset;
+                                    let mut offset = obj.base + rel.offset;
                                     let value = sym.value + lib.base + rel.addend;
 
                                     unsafe {
