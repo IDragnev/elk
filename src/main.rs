@@ -6,6 +6,14 @@ use std::{
 };
 
 fn main() -> Result<(), Box<dyn Error>> {
+    if let Err(e) = do_main() {
+        eprintln!("Fatal error: {}", e);
+    };
+
+    Ok(())
+}
+
+fn do_main() -> Result<(), Box<dyn Error>> {
     let input_path = env::args().nth(1).expect("usage: elk FILE");
 
     let mut proc = process::Process::new();
