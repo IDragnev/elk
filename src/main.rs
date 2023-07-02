@@ -5,12 +5,10 @@ use std::{
     error::Error,
 };
 
-fn main() -> Result<(), Box<dyn Error>> {
+fn main() {
     if let Err(e) = do_main() {
         eprintln!("Fatal error: {}", e);
-    };
-
-    Ok(())
+    }
 }
 
 fn do_main() -> Result<(), Box<dyn Error>> {
