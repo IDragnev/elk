@@ -1,4 +1,5 @@
 mod process;
+mod name;
 
 use std::{
     env,
