@@ -110,6 +110,7 @@ dependencies = [
  "enumflags2",
  "mmap",
  "multimap",
+ "nom",
  "region",
  "thiserror",
 ]

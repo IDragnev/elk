@@ -12,5 +12,6 @@ delf = { version = "0.1.0", path = "../delf" }
 enumflags2 = "0.6"
 mmap = "0.1"
 multimap = "0.9.0"
+nom = "5"
 region = "2"
 thiserror = "1"
