@@ -52,7 +52,7 @@ pub enum LoadError {
     NotFound(String),
     #[error("And invalid or unsupported path was encountered")]
     InvalidPath(PathBuf),
-    #[error("I/O error: {0}")]
+    #[error("I/O error: {0} - {1}")]
     IO(PathBuf, std::io::Error),
     #[error("ELF object could not be parsed: {0}")]
     ParseError(PathBuf),
@@ -155,7 +155,9 @@ impl Process {
         Self {
             objects: Vec::new(),
             objects_by_path: HashMap::new(),
-            search_path: vec!["/usr/lib".into()],
+            search_path: vec![
+                "/usr/lib".into(),
+            ],
         }
     }
 
