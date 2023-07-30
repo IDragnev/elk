@@ -4,8 +4,8 @@ mod procfs;
 
 use thiserror::*;
 use std::{
-    env,
     error::Error,
+    fmt,
 };
 use argh::{
     FromArgs,
@@ -134,16 +134,104 @@ fn cmd_autosym(args: AutosymArgs) -> Result<(), Box<dyn Error>> {
     })
 }
 
+struct Size(pub delf::Addr);
+
+impl fmt::Debug for Size {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        const KIB: u64 = 1024;
+        const MIB: u64 = 1024 * KIB;
+
+        let x = (self.0).0;
+        #[allow(overlapping_range_endpoints)]
+        #[allow(clippy::clippy::match_overlapping_arm)]
+        match x {
+            0..=KIB => write!(f, "{} B", x),
+            KIB..=MIB => write!(f, "{} KiB", x / KIB),
+            _ => write!(f, "{} MiB", x / MIB),
+        }
+    }
+}
+
 fn cmd_dig(args: DigArgs) -> Result<(), Box<dyn Error>> {
     let addr = delf::Addr(args.addr);
 
     process_mappings(args.pid, |mappings| {
-        for mapping in mappings {
-            if mapping.addr_range.contains(&addr) {
-                println!("Found mapping: {:#?}", mapping);
-                return Ok(());
-            }
+        let mapping = match mappings.iter().find(|m| m.addr_range.contains(&addr)) {
+            Some(m) => m,
+            None => {
+                println!("Could not find {:?}", addr);
+                return Ok(())
+            },
+        };
+
+        println!("Mapped {:?} from {:?}", mapping.perms, mapping.source);
+        println!(
+            "(Map range: {:?}, {:?} total)",
+            mapping.addr_range,
+            Size(mapping.addr_range.end - mapping.addr_range.start),
+        );
+
+        let path = match mapping.source {
+            procfs::Source::File(p) => p,
+            _ => return Ok(()),
+        };
+
+        let contents = std::fs::read(path)?;
+        let file = match delf::File::parse_or_print_error(&contents) {
+            Some(x) => x,
+            _ => return Ok(())
+        };
+
+        let offset = addr + mapping.offset - mapping.addr_range.start;
+        let segment = match file
+            .program_headers
+            .iter()
+            .find(|ph| ph.file_range().contains(&offset))
+        {
+            Some(s) => s,
+            None => return Ok(()),
+        };
+
+        let vaddr = offset + segment.vaddr - segment.offset;
+        println!("Object virtual address: {:?}", vaddr);
+
+        let section = match file
+            .section_headers
+            .iter()
+            .find(|sh| sh.mem_range().contains(&vaddr))
+        {
+            Some(s) => s,
+            None => return Ok(()),
+        };
+
+        let section_name = file.shstrtab_entry(section.name);
+        let section_offset = vaddr - section.addr;
+        println!(
+            "At section {:?} + {} (0x{:x})",
+            String::from_utf8_lossy(section_name),
+            section_offset.0,
+            section_offset.0,
+        );
+
+        match file.read_symtab_entries() {
+            Ok(syms) => {
+                for sym in &syms {
+                    let sym_range = sym.value..(sym.value + delf::Addr(sym.size));
+                    if sym.value == vaddr || sym_range.contains(&vaddr) {
+                        let sym_offset = vaddr - sym.value;
+                        let sym_name = String::from_utf8_lossy(file.strtab_entry(sym.name));
+                        println!(
+                            "At symbol {:?} + {} (0x{:x})",
+                            sym_name,
+                            sym_offset.0,
+                            sym_offset.0,
+                        );
+                    }
+                }
+            },
+            Err(e) => println!("Could not read syms: {:?}", e),
         }
+
         Ok(())
     })
 }
