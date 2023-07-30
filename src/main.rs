@@ -28,8 +28,8 @@ enum SubCommand {
 
 #[derive(FromArgs, PartialEq, Debug)]
 #[argh(subcommand, name = "autosym")]
-/// Given a PID, spit out GDB commands to load all .so files
-/// mapped in memory
+/// Given a PID, spit out GDB commands to load the symbols of
+/// all .so files mapped in memory
 struct AutosymArgs {
     #[argh(positional)]
     /// the PID of the proccess to examine
@@ -114,7 +114,7 @@ fn cmd_autosym(args: AutosymArgs) -> Result<(), Box<dyn Error>> {
         let section = match file
             .section_headers
             .iter()
-            .find(|sh| file.get_section_name(&contents, sh.name).unwrap() == b".text")
+            .find(|sh| file.shstrtab_entry(sh.name) == b".text")
         {
             Some(section) => section,
             _ => return Ok(()),

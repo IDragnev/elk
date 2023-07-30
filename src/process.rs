@@ -174,6 +174,7 @@ impl Process {
                 .into_iter()
                 .map(|index| &self.objects[index].file)
                 .flat_map(|file| file.dynamic_entry_strings(delf::DynamicTag::Needed))
+                .map(|s| String::from_utf8_lossy(s).to_string())
                 .collect::<Vec<_>>()
                 .into_iter()
                 .map(|dep| self.get_object(&dep))
@@ -207,6 +208,7 @@ impl Process {
                          .ok_or_else(|| LoadError::InvalidPath(path.clone()))?;
 
         for rpath in file.dynamic_entry_strings(delf::DynamicTag::RunPath) {
+            let rpath = String::from_utf8_lossy(rpath);
             let rpath = rpath.replace("$ORIGIN", &origin);
             println!("Found RPATH entry {:?}", rpath);
 
@@ -276,16 +278,20 @@ impl Process {
             })
             .collect::<Result<Vec<_>, _>>()?;
 
-        let syms = file.read_syms()?;
-        let str_tab_addr = file.get_dynamic_entry(delf::DynamicTag::StrTab)
-                               .unwrap_or_else(|_| panic!("String table not found in {:?}", path));
-        let syms: Vec<NamedSym> = syms
-            .into_iter()
-            .map(|sym| unsafe {
-                let name = Name::from_addr(base + str_tab_addr + sym.name);
-                NamedSym { sym, name }
-            })
-            .collect();
+        let syms = file.read_dynsym_entries()?;
+        let syms: Vec<_> = if syms.is_empty() {
+            vec![]
+        }
+        else {
+            let dynstr_addr = file.get_dynamic_entry(delf::DynamicTag::StrTab)
+                                  .unwrap_or_else(|_| panic!("String table not found in {:?}", path));
+            syms.into_iter()
+                .map(|sym| unsafe {
+                    let name = Name::from_addr(base + dynstr_addr + sym.name);
+                    NamedSym { sym, name }
+                })
+                .collect()
+        };
 
         let mut sym_map = MultiMap::new();
         for sym in &syms {
