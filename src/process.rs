@@ -253,6 +253,7 @@ impl Process {
                         &[
                             MapOption::MapReadable,
                             MapOption::MapWritable,
+                            MapOption::MapExecutable,
                             MapOption::MapFd(fs_file.as_raw_fd()),
                             MapOption::MapOffset(offset.into()),
                             MapOption::MapAddr(unsafe { (base + vaddr).as_ptr() }),
@@ -298,7 +299,9 @@ impl Process {
             sym_map.insert(sym.name.clone(), sym.clone());
         }
 
-        let relocations = file.read_rela_entries()?; 
+        let mut relocations = file.read_rela_entries()?; 
+        relocations.extend(file.read_jmp_rel_entries()?);
+
         let obj = Object {
             path: path.clone(),
             base,
@@ -382,6 +385,10 @@ impl Process {
             },
             RT::Relative => unsafe {
                 objrel.addr().set(obj.base + rel.addend);
+            },
+            RT::IRelative => unsafe {
+                let selector: extern "C" fn() -> delf::Addr = std::mem::transmute(obj.base + rel.addend);
+                objrel.addr().set(selector());
             },
             _ => return Err(RelocationError::UnimplementedRelocation(rel.reloc_type)),
         }
