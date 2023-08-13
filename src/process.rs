@@ -256,7 +256,7 @@ impl Process {
                             MapOption::MapExecutable,
                             MapOption::MapFd(fs_file.as_raw_fd()),
                             MapOption::MapOffset(offset.into()),
-                            MapOption::MapAddr(unsafe { (base + vaddr).as_ptr() }),
+                            MapOption::MapAddr((base + vaddr).as_ptr()),
                         ],
                 )?;
 
