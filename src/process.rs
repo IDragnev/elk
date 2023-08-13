@@ -18,6 +18,7 @@ use std::{
         min,
         max,
     },
+    sync::Arc,
 };
 use enumflags2::BitFlags;
 use crate::name::Name;
@@ -25,7 +26,8 @@ use crate::name::Name;
 #[derive(CustomDebug)]
 pub struct Segment {
     #[debug(skip)]
-    pub map: MemoryMap,
+    pub map: Arc<MemoryMap>,
+    pub vaddr_range: Range<delf::Addr>,
     pub padding: delf::Addr,
     pub flags: BitFlags<delf::SegmentFlag>,
 }
@@ -35,7 +37,7 @@ pub struct Object {
     pub path: PathBuf,
     pub base: delf::Addr,
     pub mem_range: Range<delf::Addr>,
-    pub maps: Vec<Segment>,
+    pub loaded_segments: Vec<Segment>,
     #[debug(skip)]
     pub file: delf::File,
     #[debug(skip)]
@@ -72,12 +74,12 @@ pub enum RelocationError {
     UnimplementedRelocation(delf::RelType),
     #[error("Unknown symbol number: {0}")]
     UnknownSymbolNumber(u32),
-    #[error("Undefined symbol: {0}")]
-    UndefinedSymbol(String),
+    #[error("Undefined symbol: {0:?}")]
+    UndefinedSymbol(NamedSym),
 }
 
 #[derive(Debug, Clone)]
-struct NamedSym {
+pub struct NamedSym {
     sym: delf::Sym,
     name: Name,
 }
@@ -238,7 +240,7 @@ impl Process {
         )?);
         let base = delf::Addr(mem_map.data() as _) - mem_range.start;
 
-        let maps = load_segments()
+        let loaded_segments = load_segments()
             .filter(|ph| ph.memsz.0 > 0)
             .map(|ph| -> Result<_, LoadError> {
                 use std::os::unix::io::AsRawFd;
@@ -272,7 +274,8 @@ impl Process {
                 }
 
                 Ok(Segment {
-                    map,
+                    map: Arc::new(map),
+                    vaddr_range: vaddr..(ph.vaddr + ph.memsz),
                     padding,
                     flags: ph.flags,
                 })
@@ -286,9 +289,17 @@ impl Process {
         else {
             let dynstr_addr = file.get_dynamic_entry(delf::DynamicTag::StrTab)
                                   .unwrap_or_else(|_| panic!("String table not found in {:?}", path));
+            let dynstr_segment = loaded_segments
+                .iter()
+                .find(|seg| seg.vaddr_range.contains(&dynstr_addr))
+                .unwrap_or_else(|| panic!("Segment not found for string table in {:#?}", path));
+
             syms.into_iter()
-                .map(|sym| unsafe {
-                    let name = Name::from_addr(base + dynstr_addr + sym.name);
+                .map(|sym| {
+                    let name = Name::mapped(
+                        &dynstr_segment.map,
+                        (dynstr_addr + sym.name - dynstr_segment.vaddr_range.start).into(),
+                    );
                     NamedSym { sym, name }
                 })
                 .collect()
@@ -305,7 +316,7 @@ impl Process {
         let obj = Object {
             path: path.clone(),
             base,
-            maps,
+            loaded_segments,
             file,
             mem_range,
             syms,
@@ -369,7 +380,7 @@ impl Process {
                 ResolvedSym::Undefined => {
                     match wanted.sym.sym.bind {
                         delf::SymBind::Weak => ResolvedSym::Undefined, // weak symbols can be undefined 
-                        _ => return Err(RelocationError::UndefinedSymbol(format!("{:?}", wanted))),
+                        _ => return Err(RelocationError::UndefinedSymbol(wanted.sym.clone())),
                     }
                 },
                 x => x,
@@ -402,7 +413,7 @@ impl Process {
         use delf::SegmentFlag as SF;
 
         for obj in &self.objects {
-            for seg in &obj.maps {
+            for seg in &obj.loaded_segments {
                 let mut prot = Protection::NONE;
                 for flag in seg.flags.iter() {
                     prot |= match flag {
