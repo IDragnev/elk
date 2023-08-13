@@ -244,12 +244,13 @@ fn cmd_run(args: RunArgs) -> Result<(), Box<dyn Error>> {
 
     let exec_obj = &proc.objects[exec_index];
     let entry_point = exec_obj.file.entry_point + exec_obj.base;
-    unsafe { jmp(entry_point.as_ptr()) };
-
-    Ok(())
+    unsafe {
+        jmp_entry_point(entry_point.as_ptr())
+    }
 }
 
-unsafe fn jmp(addr: *const u8) {
-    let fn_ptr: fn() = std::mem::transmute(addr);
-    fn_ptr();
+unsafe fn jmp_entry_point(entry_point: *const u8) -> ! {
+    type EntryPointFn = unsafe extern "C" fn() -> !;
+    let entry_point: EntryPointFn = std::mem::transmute(entry_point);
+    entry_point();
 }

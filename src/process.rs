@@ -387,7 +387,8 @@ impl Process {
                 objrel.addr().set(obj.base + rel.addend);
             },
             RT::IRelative => unsafe {
-                let selector: extern "C" fn() -> delf::Addr = std::mem::transmute(obj.base + rel.addend);
+                type Selector = unsafe extern "C" fn() -> delf::Addr;
+                let selector: Selector = std::mem::transmute(obj.base + rel.addend);
                 objrel.addr().set(selector());
             },
             _ => return Err(RelocationError::UnimplementedRelocation(rel.reloc_type)),
