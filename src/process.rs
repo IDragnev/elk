@@ -70,8 +70,8 @@ pub enum LoadError {
 
 #[derive(thiserror::Error, Debug)]
 pub enum RelocationError {
-    #[error("Unimplemented relocation: {0:?}")]
-    UnimplementedRelocation(delf::RelType),
+    #[error("{0:?}: unimplemented relocation: {1:?}")]
+    UnimplementedRelocation(PathBuf, delf::RelType),
     #[error("Unknown symbol number: {0}")]
     UnknownSymbolNumber(u32),
     #[error("Undefined symbol: {0:?}")]
@@ -402,7 +402,15 @@ impl Process {
                 let selector: Selector = std::mem::transmute(obj.base + rel.addend);
                 objrel.addr().set(selector());
             },
-            _ => return Err(RelocationError::UnimplementedRelocation(rel.reloc_type)),
+            RT::GlobDat | RT::JumpSlot => unsafe {
+                objrel.addr().set(found.value());
+            },
+            _ => {
+                return Err(RelocationError::UnimplementedRelocation(
+                    obj.path.clone(),
+                    rel.reloc_type,
+                ))
+            }
         }
 
         Ok(())
