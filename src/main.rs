@@ -1,14 +1,22 @@
+#![feature(asm)]
+
 mod process;
 mod name;
 mod procfs;
+mod auxv;
 
 use thiserror::*;
 use std::{
     error::Error,
     fmt,
+    ffi::CString,
 };
 use argh::{
     FromArgs,
+};
+use auxv::{
+    AuxType,
+    Auxv,
 };
 
 #[derive(FromArgs, PartialEq, Debug)]
@@ -43,6 +51,9 @@ struct RunArgs {
     #[argh(positional)]
     /// the absolute path of an executable file to load and run
     exec_path: String,
+    #[argh(positional)]
+    /// arguments for the executable file
+    args: Vec<String>,
 }
 
 #[derive(FromArgs, PartialEq, Debug)]
@@ -238,19 +249,114 @@ fn cmd_dig(args: DigArgs) -> Result<(), Box<dyn Error>> {
 
 fn cmd_run(args: RunArgs) -> Result<(), Box<dyn Error>> {
     let mut proc = process::Process::new();
-    let exec_index = proc.load_object_and_dependencies(args.exec_path)?;
+    let exec_index = proc.load_object_and_dependencies(args.exec_path.clone())?;
     proc.apply_relocations()?;
     proc.adjust_protections()?;
 
-    let exec_obj = &proc.objects[exec_index];
-    let entry_point = exec_obj.file.entry_point + exec_obj.base;
+    let exec = &proc.objects[exec_index];
+    let args = std::iter::once(CString::new(args.exec_path.as_bytes()).unwrap())
+        .chain(
+            args.args.iter().map(|s| CString::new(s.as_bytes()).unwrap()),
+        )
+        .collect();
+
+    let opts = StartOptions {
+        exec,
+        args,
+        env: std::env::vars()
+            .map(|(k, v)| CString::new(format!("{}={}", k, v)).unwrap())
+            .collect(),
+        auxv: Auxv::get_known(), // temporary
+    };
+    start(&opts);
+
+    Ok(())
+}
+
+pub struct StartOptions<'a> {
+    pub exec: &'a process::Object,
+    pub args: Vec<CString>,
+    pub env: Vec<CString>,
+    pub auxv: Vec<Auxv>,
+}
+
+pub fn start(opts: &StartOptions) {
+    let exec = opts.exec;
+    let entry_point = exec.file.entry_point + exec.base;
+    let stack = build_stack(opts);
+
     unsafe {
-        jmp_entry_point(entry_point.as_ptr())
+        jmp(entry_point.as_ptr(), stack.as_ptr(), stack.len());
     }
 }
 
-unsafe fn jmp_entry_point(entry_point: *const u8) -> ! {
-    type EntryPointFn = unsafe extern "C" fn() -> !;
-    let entry_point: EntryPointFn = std::mem::transmute(entry_point);
-    entry_point();
+fn build_stack(opts: &StartOptions) -> Vec<u64> {
+    let mut stack: Vec<u64> = Vec::new();
+
+    let null = 0_u64;
+
+    macro_rules! push {
+        ($x:expr) => {
+            stack.push($x as u64)
+        };
+    }
+
+    // argc
+    push!(opts.args.len());
+
+    // argv
+    for v in &opts.args {
+        push!(v.as_ptr());
+    }
+    push!(null);
+
+    // envp
+    for v in &opts.env {
+        push!(v.as_ptr());
+    }
+    push!(null);
+
+    // auxv
+    for v in &opts.auxv {
+        push!(v.typ);
+        push!(v.value);
+    }
+    push!(AuxType::Null);
+    push!(null);
+
+    // align stack to 16-byte boundary
+    if stack.len() % 2 == 1 {
+        stack.push(0);
+    }
+
+    stack
+}
+
+#[inline(never)]
+unsafe fn jmp(entry_point: *const u8, stack_contents: *const u64, qword_count: usize) {
+    use core::arch::asm;
+
+    asm!(
+        // allocate (qword_count * 8) bytes
+        "mov {tmp}, {qword_count}",
+        "sal {tmp}, 3",
+        "sub rsp, {tmp}",
+
+        "2:",
+        // start at i = (n-1)
+        "sub {qword_count}, 1",
+        // copy qwords to the stack
+        "mov {tmp}, QWORD PTR [{stack_contents}+{qword_count}*8]",
+        "mov QWORD PTR [rsp+{qword_count}*8], {tmp}",
+        // loop if i isn't zero, break otherwise
+        "test {qword_count}, {qword_count}",
+        "jnz 2b",
+
+        "jmp {entry_point}",
+
+        entry_point = in(reg) entry_point,
+        stack_contents = in(reg) stack_contents,
+        qword_count = in(reg) qword_count,
+        tmp = out(reg) _,
+    )
 }
