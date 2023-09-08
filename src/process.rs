@@ -131,10 +131,79 @@ impl ObjectRel<'_> {
 }
 
 #[derive(Debug)]
-pub struct Process {
+pub struct Loader {
     pub objects: Vec<Object>,
     pub objects_by_path: HashMap<PathBuf, usize>,
     pub search_path: Vec<PathBuf>,
+}
+
+pub trait ProcessState {
+    fn loader(&self) -> &Loader;
+}
+
+pub struct Process<S: ProcessState> {
+    pub state: S,
+}
+
+pub struct Loading {
+    pub loader: Loader,
+}
+
+pub struct TLS {
+    // offset to the left of tcb_addr for each loaded ELF object
+    offsets: HashMap<delf::Addr, delf::Addr>,
+    block: Vec<u8>,
+    pub tcb_addr: delf::Addr,
+}
+
+pub struct TLSAllocated {
+    pub loader: Loader,
+    pub tls: TLS,
+}
+
+pub struct Relocated {
+    loader: Loader,
+    tls: TLS,
+}
+
+pub struct TLSInitialized {
+    loader: Loader,
+    tls: TLS,
+}
+
+pub struct Protected {
+    pub loader: Loader,
+    pub tls: TLS,
+}
+
+impl ProcessState for Loading {
+    fn loader(&self) -> &Loader {
+        &self.loader
+    }
+}
+
+impl ProcessState for TLSAllocated {
+    fn loader(&self) -> &Loader {
+        &self.loader
+    }
+}
+
+impl ProcessState for Relocated {
+    fn loader(&self) -> &Loader {
+        &self.loader
+    }
+}
+
+impl ProcessState for TLSInitialized {
+    fn loader(&self) -> &Loader {
+        &self.loader
+    }
+}
+
+impl ProcessState for Protected {
+    fn loader(&self) -> &Loader {
+        &self.loader
+    }
 }
 
 pub enum GetResult {
@@ -152,14 +221,18 @@ impl GetResult {
     }
 }
 
-impl Process {
+impl Process<Loading> {
     pub fn new() -> Self {
         Self {
-            objects: Vec::new(),
-            objects_by_path: HashMap::new(),
-            search_path: vec![
-                "/usr/lib".into(),
-            ],
+            state: Loading {
+                loader: Loader {
+                    objects: Vec::new(),
+                    objects_by_path: HashMap::new(),
+                    search_path: vec![
+                        "/usr/lib".into(),
+                    ],
+                },
+            },
         }
     }
 
@@ -174,7 +247,7 @@ impl Process {
         while a.is_empty() == false {
             a = a
                 .into_iter()
-                .map(|index| &self.objects[index].file)
+                .map(|index| &self.state.loader.objects[index].file)
                 .flat_map(|file| file.dynamic_entry_strings(delf::DynamicTag::Needed))
                 .map(|s| String::from_utf8_lossy(s).to_string())
                 .collect::<Vec<_>>()
@@ -214,7 +287,7 @@ impl Process {
             let rpath = rpath.replace("$ORIGIN", &origin);
             println!("Found RPATH entry {:?}", rpath);
 
-            self.search_path.push(PathBuf::from(rpath));
+            self.state.loader.search_path.push(PathBuf::from(rpath));
         }
 
         let load_segments = || {
@@ -323,32 +396,102 @@ impl Process {
             sym_map,
             relocations,
         };
-        let index = self.objects.len();
-        self.objects.push(obj);
-        self.objects_by_path.insert(path, index);
+        let index = self.state.loader.objects.len();
+        self.state.loader.objects.push(obj);
+        self.state.loader.objects_by_path.insert(path, index);
 
         Ok(index)
     }
 
     pub fn get_object(&mut self, name: &str) -> Result<GetResult, LoadError> {
         let path = self.object_path(name)?;
-        self.objects_by_path
+        self.state
+            .loader
+            .objects_by_path
             .get(&path)
             .map(|&index| Ok(GetResult::Cached(index)))
             .unwrap_or_else(|| self.load_object(path).map(GetResult::Fresh))
     }
 
     pub fn object_path(&self, name: &str) -> Result<PathBuf, LoadError> {
-        self.search_path
+        self.state
+            .loader
+            .search_path
             .iter()
             .filter_map(|prefix| prefix.join(name).canonicalize().ok())
             .find(|path| path.exists())
             .ok_or_else(|| LoadError::NotFound(name.into()))
     }
 
-    pub fn apply_relocations(&self) -> Result<(), RelocationError> {
+    pub fn allocate_tls(mut self) -> Process<TLSAllocated> {
+        let mut offsets = HashMap::new();
+        // total space needed for all thread-local variables of all ELF objects
+        let mut storage_space = 0;
+
+        for obj in &mut self.state.loader.objects {
+            let needed_space = obj
+                .file
+                .segment_of_type(delf::SegmentType::TLS)
+                .map(|ph| ph.memsz.0)
+                .unwrap_or_default() as u64;
+
+            if needed_space > 0 {
+                // backwards offset (to the start address for this ELF)
+                // going left from tcb_addr
+                let offset = delf::Addr(storage_space + needed_space);
+                offsets.insert(obj.base, offset);
+                storage_space += needed_space;
+            }
+        }
+
+        let storage_space = storage_space as usize;
+        let tcb_head_size = 704;
+        let total_size = storage_space + tcb_head_size;
+
+        // allocate the whole capacity upfront so the vector doesn't 
+        // get resized, and `tcb_addr` doesn't get invalidated
+        let mut block = Vec::with_capacity(total_size);
+        let tcb_addr = delf::Addr(block.as_ptr() as u64 + storage_space as u64);
+        for _ in 0..storage_space {
+            // for now, zero out storage
+            block.push(0u8);
+        }
+
+        // build a "somewhat fake" tcbhead structure
+        block.extend(&tcb_addr.0.to_le_bytes()); // tcb
+        block.extend(&0_u64.to_le_bytes()); // dtv
+        block.extend(&tcb_addr.0.to_le_bytes()); // thread pointer
+        block.extend(&0_u32.to_le_bytes()); // multiple_threads
+        block.extend(&0_u32.to_le_bytes()); // gscope_flag
+        block.extend(&0_u64.to_le_bytes()); // sysinfo
+        block.extend(&0xDEADBEEF_u64.to_le_bytes()); // stack guard
+        block.extend(&0xFEEDFACE_u64.to_le_bytes()); // pointer guard
+        while block.len() < block.capacity() {
+            // just pad out with zeros
+            block.push(0u8);
+        }
+
+        let tls = TLS {
+            offsets,
+            block: block,
+            tcb_addr,
+        };
+
+        Process {
+            state: TLSAllocated {
+                loader: self.state.loader,
+                tls,
+            },
+        }
+    }
+}
+
+impl Process<TLSAllocated> {
+    pub fn apply_relocations(self) -> Result<Process<Relocated>, RelocationError> {
         let rels: Vec<ObjectRel> = self
-            .objects 
+            .state
+            .loader
+            .objects
             .iter()
             .rev()
             .map(|obj| {
@@ -361,7 +504,12 @@ impl Process {
             self.apply_relocation(rel)?;
         }
 
-        Ok(())
+        Ok(Process {
+            state: Relocated {
+                loader: self.state.loader,
+                tls: self.state.tls,
+            }
+        })
     }
 
     fn apply_relocation(&self, objrel: ObjectRel) -> Result<(), RelocationError> {
@@ -405,6 +553,20 @@ impl Process {
             RT::GlobDat | RT::JumpSlot => unsafe {
                 objrel.addr().set(found.value());
             },
+            RT::TPOff64 => unsafe {
+                if let ResolvedSym::Defined(sym) = found {
+                    let obj_offset = self
+                        .state
+                        .tls
+                        .offsets
+                        .get(&sym.obj.base)
+                        .unwrap_or_else(|| panic!("No thread-local storage allocated for object {:?}", sym.obj.file));
+
+                    let obj_offset = -(obj_offset.0 as i64);
+                    let offset = obj_offset + sym.sym.sym.value.0 as i64 + objrel.rel.addend.0 as i64;
+                    objrel.addr().set(offset);
+                }
+            },
             _ => {
                 return Err(RelocationError::UnimplementedRelocation(
                     obj.path.clone(),
@@ -415,12 +577,39 @@ impl Process {
 
         Ok(())
     }
+}
 
-    pub fn adjust_protections(&self) -> Result<(), region::Error> {
+impl Process<Relocated> {
+    pub fn initialize_tls(self) -> Process<TLSInitialized> {
+        let tls = &self.state.tls;
+
+        for obj in &self.state.loader.objects {
+            if let Some(ph) = obj.file.segment_of_type(delf::SegmentType::TLS) {
+                if let Some(offset) = tls.offsets.get(&obj.base).cloned() {
+                    unsafe {
+                        (tls.tcb_addr - offset).write(
+                            (ph.vaddr + obj.base).as_slice(ph.filesz.into())
+                        );
+                    }
+                }
+            }
+        }
+
+        Process {
+            state: TLSInitialized {
+                loader: self.state.loader,
+                tls: self.state.tls,
+            },
+        }
+    }
+}
+
+impl Process<TLSInitialized> {
+    pub fn adjust_protections(self) -> Result<Process<Protected>, region::Error> {
         use region::{protect, Protection};
         use delf::SegmentFlag as SF;
 
-        for obj in &self.objects {
+        for obj in &self.state.loader.objects {
             for seg in &obj.loaded_segments {
                 let mut prot = Protection::NONE;
                 for flag in seg.flags.iter() {
@@ -437,15 +626,22 @@ impl Process {
             }
         }
 
-        Ok(())
+        Ok(Process{
+            state: Protected {
+                loader: self.state.loader,
+                tls: self.state.tls,
+            }
+        })
     }
+}
 
+impl<S: ProcessState> Process<S> {
     fn lookup_symbol(
         &self,
         wanted: &ObjectSym,
         ignore_self: bool,
     ) -> ResolvedSym {
-        for obj in &self.objects {
+        for obj in &self.state.loader().objects {
             if ignore_self && std::ptr::eq(wanted.obj, obj) {
                 continue;
             }

@@ -1,5 +1,3 @@
-#![feature(asm)]
-
 mod process;
 mod name;
 mod procfs;
@@ -250,42 +248,46 @@ fn cmd_dig(args: DigArgs) -> Result<(), Box<dyn Error>> {
 fn cmd_run(args: RunArgs) -> Result<(), Box<dyn Error>> {
     let mut proc = process::Process::new();
     let exec_index = proc.load_object_and_dependencies(args.exec_path.clone())?;
-    proc.apply_relocations()?;
-    proc.adjust_protections()?;
 
-    let exec = &proc.objects[exec_index];
+    let proc = proc.allocate_tls();
+    let proc = proc.apply_relocations()?;
+    let proc = proc.initialize_tls();
+    let proc = proc.adjust_protections()?;
+
     let args = std::iter::once(CString::new(args.exec_path.as_bytes()).unwrap())
         .chain(
             args.args.iter().map(|s| CString::new(s.as_bytes()).unwrap()),
         )
         .collect();
+    let env = std::env::vars()
+        .map(|(k, v)| CString::new(format!("{}={}", k, v)).unwrap())
+        .collect();
 
     let opts = StartOptions {
-        exec,
+        exec_index,
         args,
-        env: std::env::vars()
-            .map(|(k, v)| CString::new(format!("{}={}", k, v)).unwrap())
-            .collect(),
+        env,
         auxv: Auxv::get_known(), // temporary
     };
-    start(&opts);
+    start(proc, opts);
 
     Ok(())
 }
 
-pub struct StartOptions<'a> {
-    pub exec: &'a process::Object,
+pub struct StartOptions {
+    pub exec_index: usize,
     pub args: Vec<CString>,
     pub env: Vec<CString>,
     pub auxv: Vec<Auxv>,
 }
 
-pub fn start(opts: &StartOptions) {
-    let exec = opts.exec;
+pub fn start(proc: process::Process<process::Protected>, opts: StartOptions) -> ! {
+    let exec = &proc.state.loader.objects[opts.exec_index];
     let entry_point = exec.file.entry_point + exec.base;
-    let stack = build_stack(opts);
+    let stack = build_stack(&opts);
 
     unsafe {
+        set_fs(proc.state.tls.tcb_addr.0);
         jmp(entry_point.as_ptr(), stack.as_ptr(), stack.len());
     }
 }
@@ -333,7 +335,7 @@ fn build_stack(opts: &StartOptions) -> Vec<u64> {
 }
 
 #[inline(never)]
-unsafe fn jmp(entry_point: *const u8, stack_contents: *const u64, qword_count: usize) {
+unsafe fn jmp(entry_point: *const u8, stack_contents: *const u64, qword_count: usize) -> ! {
     use core::arch::asm;
 
     asm!(
@@ -358,5 +360,22 @@ unsafe fn jmp(entry_point: *const u8, stack_contents: *const u64, qword_count: u
         stack_contents = in(reg) stack_contents,
         qword_count = in(reg) qword_count,
         tmp = out(reg) _,
+    );
+    asm!("ud2", options(noreturn));
+}
+
+#[inline(never)]
+unsafe fn set_fs(addr: u64) {
+    use core::arch::asm;
+
+    let syscall_number: u64 = 158;
+    let arch_set_fs: u64 = 0x1002;
+
+    asm!(
+        "syscall",
+        inout("rax") syscall_number => _,
+        in("rdi") arch_set_fs,
+        in("rsi") addr,
+        lateout("rcx") _, lateout("r11") _,
     )
 }
