@@ -230,6 +230,7 @@ impl Process<Loading> {
                     objects_by_path: HashMap::new(),
                     search_path: vec![
                         "/usr/lib".into(),
+                        "/lib/x86_64-linux-gnu".into(), // WSL
                     ],
                 },
             },
