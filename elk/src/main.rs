@@ -285,9 +285,21 @@ pub fn start(proc: process::Process<process::Protected>, opts: StartOptions) -> 
     let exec = &proc.state.loader.objects[opts.exec_index];
     let entry_point = exec.file.entry_point + exec.base;
     let stack = build_stack(&opts);
+    let initializers = proc.initializers();
+
+    let argc = opts.args.len() as i32;
+    let mut argv: Vec<_> = opts.args.iter().map(|x| x.as_ptr()).collect();
+    argv.push(std::ptr::null());
+    let mut envp: Vec<_> = opts.env.iter().map(|x| x.as_ptr()).collect();
+    envp.push(std::ptr::null());
 
     unsafe {
         set_fs(proc.state.tls.tcb_addr.0);
+
+        for (_obj, init) in initializers {
+            call_init(init, argc, argv.as_ptr(), envp.as_ptr());
+        }
+
         jmp(entry_point.as_ptr(), stack.as_ptr(), stack.len());
     }
 }
@@ -332,6 +344,13 @@ fn build_stack(opts: &StartOptions) -> Vec<u64> {
     }
 
     stack
+}
+
+#[inline(never)]
+unsafe fn call_init(addr: delf::Addr, argc: i32, argv: *const *const i8, envp: *const *const i8) {
+    let init: extern "C" fn(argc: i32, argv: *const *const i8, envp: *const *const i8) =
+        std::mem::transmute(addr.0);
+    init(argc, argv, envp);
 }
 
 #[inline(never)]

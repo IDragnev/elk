@@ -46,6 +46,8 @@ pub struct Object {
     sym_map: MultiMap<Name, NamedSym>,
     #[debug(skip)]
     pub relocations: Vec<delf::Rela>,
+    #[debug(skip)]
+    pub initializers: Vec<delf::Addr>,
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -387,6 +389,21 @@ impl Process<Loading> {
         let mut relocations = file.read_rela_entries()?; 
         relocations.extend(file.read_jmp_rel_entries()?);
 
+        let mut initializers = Vec::new();
+        if let Some(init) = file.dynamic_entry(delf::DynamicTag::Init) {
+            let init = init + base;
+            initializers.push(init);
+        }
+        if let Some(init_array) = file.dynamic_entry(delf::DynamicTag::InitArray) {
+            if let Some(init_array_sz) = file.dynamic_entry(delf::DynamicTag::InitArraySz) {
+                let init_array = base + init_array;
+                let n = init_array_sz.0 as usize / std::mem::size_of::<delf::Addr>();
+
+                let inits: &[delf::Addr] = unsafe { init_array.as_slice(n) };
+                initializers.extend(inits.iter().map(|&init| init + base))
+            }
+        }
+
         let obj = Object {
             path: path.clone(),
             base,
@@ -396,6 +413,7 @@ impl Process<Loading> {
             syms,
             sym_map,
             relocations,
+            initializers,
         };
         let index = self.state.loader.objects.len();
         self.state.loader.objects.push(obj);
@@ -655,6 +673,16 @@ impl<S: ProcessState> Process<S> {
         }
 
         ResolvedSym::Undefined
+    }
+
+    pub fn initializers(&self) -> Vec<(&Object, delf::Addr)> {
+        let mut res = Vec::new();
+
+        for obj in self.state.loader().objects.iter().rev() {
+            res.extend(obj.initializers.iter().map(|&init| (obj, init)));
+        }
+
+        res
     }
 }
 
