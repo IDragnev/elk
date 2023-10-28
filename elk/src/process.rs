@@ -50,6 +50,15 @@ pub struct Object {
     pub initializers: Vec<delf::Addr>,
 }
 
+impl Object {
+    fn symzero(&self) -> ResolvedSym {
+        ResolvedSym::Defined(ObjectSym {
+            obj: &self,
+            sym: &self.syms[0],
+        })
+    }
+}
+
 #[derive(thiserror::Error, Debug)]
 pub enum LoadError {
     #[error("ELF object not found: {0}")]
@@ -94,7 +103,14 @@ struct ObjectSym<'a> {
 
 impl ObjectSym<'_> {
     fn value(&self) -> delf::Addr {
-        self.obj.base + self.sym.sym.value
+        let addr = self.obj.base + self.sym.sym.value;
+        match self.sym.sym.sym_type {
+            delf::SymType::IFunc => unsafe {
+                let selector: extern "C" fn() -> delf::Addr = std::mem::transmute(addr);
+                selector()
+            },
+            _ => addr,
+        }
     }
 }
 
@@ -118,6 +134,19 @@ impl ResolvedSym<'_> {
             Self::Undefined => 0,
         }
     }
+
+    fn is_indirect(&self) -> bool {
+        match self {
+            Self::Undefined => false,
+            Self::Defined(sym) => matches!(sym.sym.sym.sym_type, delf::SymType::IFunc),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum RelocGroup {
+    Direct,
+    Indirect,
 }
 
 #[derive(Debug)]
@@ -236,6 +265,57 @@ impl Process<Loading> {
                     ],
                 },
             },
+        }
+    }
+
+    pub fn patch_libc(&self) {
+        let mut stub_map = std::collections::HashMap::<&str, Vec<u8>>::new();
+
+        stub_map.insert(
+            "_dl_addr",
+            vec![
+                0x48, 0x31, 0xc0, // xor rax, rax
+                0xc3, // ret
+            ],
+        );
+
+        stub_map.insert(
+            "exit",
+            vec![
+                0x48, 0x31, 0xff, // xor rdi, rdi
+                0xb8, 0x3c, 0x00, 0x00, 0x00, // mov eax, 60
+                0x0f, 0x05, // syscall
+            ],
+        );
+
+        let pattern = "/libc-2.";
+        let libc = match self
+            .state
+            .loader
+            .objects
+            .iter()
+            .find(|&obj| obj.path.to_string_lossy().contains(pattern))
+        {
+            Some(x) => x,
+            None => {
+                println!("Warning: could not find libc to patch!");
+                return;
+            }
+        };
+
+        for (name, instructions) in stub_map {
+            let name = Name::owned(name);
+            let sym = match libc.sym_map.get(&name) {
+                Some(sym) => ObjectSym { obj: libc, sym },
+                None => {
+                    println!("expected to find symbol {:?} in {:?}", name, libc.path);
+                    continue;
+                }
+            };
+            println!("Patching libc function {:?} ({:?})", sym.value(), name);
+            unsafe {
+                sym.value().write(&instructions);
+            }
         }
     }
 
@@ -507,7 +587,7 @@ impl Process<Loading> {
 
 impl Process<TLSAllocated> {
     pub fn apply_relocations(self) -> Result<Process<Relocated>, RelocationError> {
-        let rels: Vec<ObjectRel> = self
+        let mut rels: Vec<ObjectRel> = self
             .state
             .loader
             .objects
@@ -519,8 +599,15 @@ impl Process<TLSAllocated> {
             .flatten()
             .collect();
 
-        for rel in rels {
-            self.apply_relocation(rel)?;
+        for &group in &[RelocGroup::Direct, RelocGroup::Indirect] {
+            println!("Applying {:?} relocations ({} left)", group, rels.len());
+            rels = rels
+                .into_iter()
+                .map(|objrel| self.apply_relocation(objrel, group))
+                .collect::<Result<Vec<_>, _>>()?
+                .into_iter()
+                .filter_map(|x| x)
+                .collect();
         }
 
         Ok(Process {
@@ -531,7 +618,11 @@ impl Process<TLSAllocated> {
         })
     }
 
-    fn apply_relocation(&self, objrel: ObjectRel) -> Result<(), RelocationError> {
+    fn apply_relocation<'a>(
+        &self,
+        objrel: ObjectRel<'a>,
+        group: RelocGroup,
+    ) -> Result<Option<ObjectRel<'a>>, RelocationError> {
         use delf::RelType as RT;
 
         let ObjectRel { obj, rel } = objrel;
@@ -542,7 +633,7 @@ impl Process<TLSAllocated> {
         let ignore_self = matches!(rel.reloc_type, RT::Copy);
 
         let found: ResolvedSym = match rel.sym {
-            0 => ResolvedSym::Undefined,
+            0 => obj.symzero(),
             _ => match self.lookup_symbol(&wanted, ignore_self) {
                 ResolvedSym::Undefined => {
                     match wanted.sym.sym.bind {
@@ -553,6 +644,13 @@ impl Process<TLSAllocated> {
                 x => x,
             }
         };
+
+        if let RelocGroup::Direct = group {
+            if rel.reloc_type == RT::IRelative || found.is_indirect() {
+                // deferred
+                return Ok(Some(objrel));
+            }
+        }
 
         match rel.reloc_type {
             RT::_64 => unsafe {
@@ -594,7 +692,7 @@ impl Process<TLSAllocated> {
             }
         }
 
-        Ok(())
+        Ok(None)
     }
 }
 

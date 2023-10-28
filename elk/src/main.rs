@@ -249,6 +249,7 @@ fn cmd_run(args: RunArgs) -> Result<(), Box<dyn Error>> {
     let mut proc = process::Process::new();
     let exec_index = proc.load_object_and_dependencies(args.exec_path.clone())?;
 
+    proc.patch_libc();
     let proc = proc.allocate_tls();
     let proc = proc.apply_relocations()?;
     let proc = proc.initialize_tls();
@@ -296,8 +297,9 @@ pub fn start(proc: process::Process<process::Protected>, opts: StartOptions) -> 
     unsafe {
         set_fs(proc.state.tls.tcb_addr.0);
 
-        for (_obj, init) in initializers {
-            call_init(init, argc, argv.as_ptr(), envp.as_ptr());
+        #[allow(clippy::clippy::needless_range_loop)]
+        for i in 0..initializers.len() {
+            call_init(initializers[i].1, argc, argv.as_ptr(), envp.as_ptr());
         }
 
         jmp(entry_point.as_ptr(), stack.as_ptr(), stack.len());
